@@ -3,7 +3,10 @@
 #include "link_layer.h"
 #include "serial_port.h"
 #include "signal.h"
+
 #include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
 
 // MISC
 #define _POSIX_SOURCE 1 // POSIX compliant source
@@ -265,7 +268,7 @@ int llwrite(const unsigned char *buf, int bufSize) {
             }
 
             // Wait for response
-            unsigned char result = readByteSerialPort(byte);
+            unsigned char result = readByteSerialPort(&byte);
             
             // Check if the response is valid and if it's a RR or REJ
             if(!result) {
