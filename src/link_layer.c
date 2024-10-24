@@ -153,6 +153,7 @@ int llopen(LinkLayer connectionParameters) {
                 printf("ERROR: Failed to establish connection\n");
                 return -1;
             }
+            alarm(0);
             break;
         case LlRx: // Receiver
             // Wait for SET
@@ -473,6 +474,7 @@ int llclose(int showStatistics) {
                     currentTransmition--;
                 }
             }
+            alarm(0);
             break;
     }
     int clstat = closeSerialPort();

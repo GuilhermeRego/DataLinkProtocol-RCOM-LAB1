@@ -1,6 +1,100 @@
 #include "application_layer.h"
 #include "link_layer.h"
 
+#include <stdio.h>
+
+unsigned char *readFile(const char *filename, int *fileSize) {
+    // Open file
+    FILE *file = fopen(filename, "rb");
+    if (file == NULL) {
+        perror("ERROR: Failed to open file\n");
+        return NULL;
+    }
+
+    // Get file size
+    fseek(file, 0, SEEK_END);
+    *fileSize = ftell(file);
+    fseek(file, 0, SEEK_SET);
+
+    // Read file
+    unsigned char *fileData = (unsigned char *)malloc(*fileSize);
+    if (fileData == NULL) {
+        perror("ERROR: Failed to allocate memory for file\n");
+        fclose(file);
+        return NULL;
+    }
+
+    if (fread(fileData, 1, *fileSize, file) != *fileSize) {
+        perror("ERROR: Failed to read file\n");
+        fclose(file);
+        free(fileData);
+        return NULL;
+    }
+
+    fclose(file);
+    return fileData;
+}
+
+unsigned char * getControlPacket (int controlField, int fileSize, char *fileName, int *packetSize) {
+    // Calculate L1 and L2
+    int L1 = (int) ceil(log2f((float)fileSize)/8.0);
+    int L2 = strlen(fileName);
+    *packetSize = 5 + L2 + L1;
+    unsigned char *packet = (unsigned char *) malloc(*packetSize);
+
+    // Create packet
+    packet[0] = controlField;
+    packet[1] = 0x00;
+    packet[2] = L1;
+
+    for (int i = 0; i < L1; i++) {
+        packet[2 + L1 - i] = fileSize & 0xFF;
+        fileSize >>= 8;
+    }
+
+    packet[3 + L1] = 0x01;
+    packet[4 + L1] = L2;
+
+    // Copy filename to packet
+    memcpy(packet + L1 + 5, fileName, L2);
+
+    return packet;
+}
+
+unsigned char *parseControlPacket(unsigned char *packet, int packetSize, unsigned long int *fileSize) {
+    // Check if packet is valid
+    if (packet == NULL || fileSize == NULL) {
+        printf("ERROR: Invalid arguments\n");
+        return NULL;
+    }
+
+    // File size
+    unsigned char nbytes = packet[2];
+    unsigned char sizeaux[nbytes];
+    memcpy(sizeaux, packet + 3, nbytes);
+    for (int i = 0; i < nbytes; i++) {
+        *fileSize += sizeaux[i] << (8 * i);
+    }
+
+    // File name
+    unsigned char nameSize = packet[3 + nbytes];
+    unsigned char *name = (unsigned char *) malloc(nameSize);
+    memcpy(name, packet + 5 + nbytes, nameSize);
+    return name;
+}
+
+void parseDataPacket(unsigned char *packet, int packetSize, int *buffer) {
+    // Check if packet is valid
+    if (packet == NULL || buffer == NULL) {
+        printf("ERROR: Invalid arguments\n");
+        return NULL;
+    }
+
+    memcpy(buffer, packet + 4, packetSize - 4);
+    buffer += packetSize + 4;
+}
+
+
 void applicationLayer(const char *serialPort, const char *role, int baudRate, int nTries, int timeout, const char *filename) {
     // Completes the link layer struct
     LinkLayer linkLayer;
@@ -20,22 +114,116 @@ void applicationLayer(const char *serialPort, const char *role, int baudRate, in
     // Calls the appropriate function based on the role
     switch (linkLayer.role) {
         case LlTx:   // Transmiter
-            // I want to send a string to test the link layer
-            char *string = "Hello, World!";
-            if (llwrite((unsigned char *)string, strlen(string)) < 0) {
+            
+            // Read file
+            int fileSize;
+            unsigned char *fileData;
+            if ((fileData = readFile(filename, &fileSize)) == NULL) {
+                perror("ERROR: readFile\n");
+                exit(-1);
+            }
+
+            // Get start control packet
+            int packetSize;
+            unsigned char *startPacket;
+            if ((startPacket = getControlPacket(0x01, fileSize, filename, &packetSize)) == NULL) {
+                perror("ERROR: getControlPacket\n");
+                exit(-1);
+            }
+
+            // Send control packet
+            if (llwrite(startPacket, packetSize) < 0) {
                 perror("ERROR: llwrite\n");
                 exit(-1);
             }
+
+            // Send data packet
+            int sequenceNumber = 0;
+            unsigned char *data;
+            if ((data = getData(fileData, fileSize)) == NULL) {
+                perror("ERROR: getData\n");
+                exit(-1);
+            }
+
+            int writtenBytes = 0;
+            while (writtenBytes <= fileSize) {
+                // Calculate bytes to write
+                int bytesToWrite = fileSize - writtenBytes > MAX_PAYLOAD_SIZE ? MAX_PAYLOAD_SIZE : fileSize - writtenBytes;
+                
+                // Copy data to send
+                unsigned char *data = (unsigned char *) malloc(bytesToWrite);
+                memcpy(data, fileData + writtenBytes, bytesToWrite);
+                
+                // Get data packet
+                int ps;
+                unsigned char *packet;
+                if ((packet = getDataPacket(sequenceNumber, bytesToWrite, data, &ps)) == NULL) {
+                    perror("ERROR: getDataPacket\n");
+                    exit(-1);
+                }
+
+                // Write data packet
+                if (llwrite(packet, ps) < 0) {
+                    perror("ERROR: llwrite\n");
+                    exit(-1);
+                }
+                writtenBytes += bytesToWrite;
+            }
+
+            // Get end control packet
+            unsigned char *endPacket;
+            if ((endPacket = getControlPacket(0x03, fileSize, filename, &packetSize)) == NULL) {
+                perror("ERROR: getControlPacket\n");
+                exit(-1);
+            }
+
+            // Send end control packet
+            if (llwrite(endPacket, packetSize) < 0) {
+                perror("ERROR: llwrite\n");
+                exit(-1);
+            }
+
+            llclose(fd);
             break;
 
         case LlRx: {  // Receiver
-            // I want to receive a string to test the link layer
-            unsigned char buffer[MAX_PAYLOAD_SIZE];
-            if (llread(buffer) < 0) {
-                perror("ERROR: llread\n");
+
+            // Create space for control packet
+            unsigned char *packet = (unsigned char *) malloc(MAX_PAYLOAD_SIZE);
+            int packetSize = 0;
+
+            // Read control packet
+            while ((packetSize = llread(packet)) < 0);
+            unsigned long int fileSize = 0;
+            unsigned char *fileName;
+            if ((fileName = parseControlPacket(packet, packetSize, &fileName)) == NULL) {
+                perror("ERROR: getControlPacket\n");
                 exit(-1);
             }
-            printf("Received: %s\n", buffer);
+
+            // Create file
+            FILE *file = fopen(fileName, "wb");
+            if (file == NULL) {
+                perror("ERROR: Failed to create file\n");
+                exit(-1);
+            }
+            // While there are packets to read
+            while (TRUE) {
+                // Wait for packet and read it
+                while ((packetSize = llread(packet)) < 0);
+                // Check if it is the end control packet
+                if(packetSize == 0) break;
+                // Check if it is a data packet
+                else if(packet[0] != 3){
+                    unsigned char *buffer = (unsigned char*)malloc(packetSize);
+                    parseDataPacket(packet, packetSize, buffer);
+                    fwrite(buffer, sizeof(unsigned char), packetSize-4, file);
+                    free(buffer);
+                }
+                else continue;
+            }
+
+            fclose(file);
             break;
         }
     }
