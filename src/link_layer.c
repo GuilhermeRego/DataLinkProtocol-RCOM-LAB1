@@ -11,8 +11,10 @@
 #define STUFF 0x20
 
 // Receiver's response control fields to inform transmitter of the received frame
-#define C_RR(N) (0x05 | (N << 7))
-#define C_REJ(N) (0x01 | (N << 7))
+#define C_RR0 0xAA
+#define C_RR1 0xAB
+#define C_REJ0 0x54
+#define C_REJ1 0x55
 
 #define FLAG 0x7E 
 #define A_TX 0x03 // Transmitter
@@ -22,8 +24,13 @@
 #define C_SET 0x03 // Transmitter
 #define C_UA 0x07 // Receiver
 
+#define DISC 0x0B
+
+#define C_N(x) (x << 6)
+
 int timeout = 0;
 int retransmissions = 0;
+LinkLayerRole role;
 
 int alarmTriggered = FALSE;
 int alarmCount = 0;
@@ -85,14 +92,16 @@ int llopen(LinkLayer connectionParameters) {
     // Set connection parameters
     timeout = connectionParameters.timeout;
     retransmissions = connectionParameters.nRetransmissions;
+    role = connectionParameters.role;
+
     LinkLayerState state = START;
+    unsigned char byte;
 
     // Establish connection
     switch (connectionParameters.role) {
         case LlTx: // Transmitter     
             // Install alarm handler
             (void) signal(SIGALRM, alarmHandler);
-            unsigned char byte;
             while (retransmissions && state != STOP) {
                 // Set alarm timeout
                 alarm(timeout);
@@ -147,7 +156,6 @@ int llopen(LinkLayer connectionParameters) {
             break;
         case LlRx: // Receiver
             // Wait for SET
-            unsigned char byte;
             while (state != STOP) {
                 if (readByteSerialPort(&byte) < 0) {
                     printf("ERROR: Failed to read byte from serial port\n");
@@ -208,8 +216,9 @@ int llwrite(const unsigned char *buf, int bufSize) {
     unsigned char *frame = (unsigned char *) malloc(frameSize);
     frame[0] = FLAG;
     frame[1] = A_TX; 
-    frame[2] = 0x00; // PLACE HOLDER FOR CONTROL FIELD
+    frame[2] = C_N(tramaTx); // PLACE HOLDER FOR CONTROL FIELD
     frame[3] = A_TX ^ frame[2]; // BCC1 WITH PLACE HOLDER CONTROL FIELD
+    memcpy(frame+4, buf, bufSize); // Copy buffer to frame
     unsigned char BCC2 = buf[0];
     for (unsigned int i = 1 ; i < bufSize ; i++) BCC2 ^= buf[i]; // Calculate BCC2
     int written = 4;
@@ -263,13 +272,13 @@ int llwrite(const unsigned char *buf, int bufSize) {
             }
 
             // Accepted
-            else if (result == C_RR(0) || result == C_RR(1)) {
+            else if (result == C_RR0 || result == C_RR1) {
                 accepted = TRUE;
                 tramaTx = (tramaTx+1) % 2;
             }
 
             // Rejected
-            else if (result == C_REJ(0) || result == C_REJ(1)) {
+            else if (result == C_REJ0 || result == C_REJ1) {
                 rejected = TRUE;
             }
             else continue;
@@ -280,13 +289,14 @@ int llwrite(const unsigned char *buf, int bufSize) {
     }
     
     free(frame);
-    accepted ? printf("Frame accepted\n") : printf("Frame rejected\n");
-    if (accepted) return written;
-    else{
-        llclose(0); // CLOSE CONNECTION WITH PLACEHOLDER
+    if (accepted) {
+        printf("Frame sent successfully\n");
+        return bufSize;
+    }
+    else {
+        printf("ERROR: Failed to send frame\n");
         return -1;
     }
-    return written;
 }
 
 ////////////////////////////////////////////////
@@ -294,14 +304,181 @@ int llwrite(const unsigned char *buf, int bufSize) {
 ////////////////////////////////////////////////
 int llread(unsigned char *packet)
 {
-    // TODO
-    return 0;
+    // Check if buffer is empty
+    if (packet == NULL) {
+        printf("ERROR: Invalid buffer\n");
+        return -1;
+    }
+    unsigned char byte;
+    LinkLayerState state = START;
+    unsigned char *frame = (unsigned char *) malloc(MAX_PAYLOAD_SIZE);
+    int frameSize = 0;
+    int accepted = FALSE;
+    int rejected = FALSE;
+    int currentTransmition = retransmissions;
+    while (currentTransmition && !accepted) {
+        alarmTriggered = FALSE;
+        alarm(timeout);
+        rejected = FALSE;
+        accepted = FALSE;
+        while (alarmTriggered == FALSE && !rejected && !accepted) {
+            if (readByteSerialPort(&byte) < 0) {
+                printf("ERROR: Failed to read byte from serial port\n");
+                return -1;
+            }
+            switch (state) {
+                case START:
+                    if (byte == FLAG) state = FLAG_RCV;
+                    break;
+                case FLAG_RCV:
+                    if (byte == A_TX) state = A_RCV;
+                    else if (byte != FLAG) state = START;
+                    break;
+                case A_RCV:
+                    if (byte == 0x00 || byte == 0x01) {
+                        frame[0] = byte;
+                        state = C_RCV;
+                    }
+                    else if (byte == FLAG) state = FLAG_RCV;
+                    else state = START;
+                    break;
+                case C_RCV:
+                    if (byte == A_TX^frame[0]) state = BCC_OK;
+                    else if (byte == FLAG) state = FLAG_RCV;
+                    else state = START;
+                    break;
+                case BCC_OK:
+                    if (byte == FLAG) {
+                        frameSize--;
+                        accepted = TRUE;
+                    }
+                    else if (byte == ESCAPE) state = ESCAPE;
+                    else {
+                        frame[frameSize++] = byte;
+                    }
+                    break;
+                case ESCAPE:
+                    frame[frameSize++] = byte ^ STUFF;
+                    state = BCC_OK;
+                    break;
+                default:
+                    break;
+            }
+        }
+        if (accepted) break;
+        currentTransmition--;
+    }
+    if (accepted) {
+        for (int i = 0; i < frameSize; i++) {
+            packet[i] = frame[i];
+        }
+        free(frame);
+        return frameSize;
+    }
+    else {
+        free(frame);
+        return -1;
+    }
+    return frameSize;
 }
 
 ////////////////////////////////////////////////
 // LLCLOSE
 ////////////////////////////////////////////////
 int llclose(int showStatistics) {
+    unsigned char byte;
+    LinkLayerState state = START;
+    int currentTransmition = retransmissions;
+    switch (role) {
+        case LlRx:
+            // Wait for DISC
+            while (state != STOP) {
+                if (readByteSerialPort(&byte) < 0) {
+                    printf("ERROR: Failed to read byte from serial port\n");
+                    return -1;
+                }
+                switch (state) {
+                    case START:
+                        if (byte == FLAG) state = FLAG_RCV;
+                        break;
+                    case FLAG_RCV:
+                        if (byte == A_TX) state = A_RCV;
+                        else if (byte != FLAG) state = START;
+                        break;
+                    case A_RCV:
+                        if (byte == DISC) state = C_RCV;
+                        else if (byte == FLAG) state = FLAG_RCV;
+                        else state = START;
+                        break;
+                    case C_RCV:
+                        if (byte == A_TX^DISC) state = BCC_OK;
+                        else if (byte == FLAG) state = FLAG_RCV;
+                        else state = START;
+                        break;
+                    case BCC_OK:
+                        if (byte == FLAG) state = STOP;
+                        else state = START;
+                        break;
+                    default:
+                        break;
+                }
+            }
+            // Send DISC
+            if (writeRX(DISC) < 0) {
+                printf("ERROR: Failed to send DISC\n");
+                return -1;
+            }
+            break;
+        case LlTx:
+            // Send DISC
+            while (currentTransmition && state != STOP) {
+                alarmTriggered = FALSE;
+                alarm(timeout);
+                while (alarmTriggered == FALSE) {
+                    if (writeTX(DISC) < 0) {
+                        printf("ERROR: Failed to send DISC\n");
+                        return -1;
+                    }
+                    if (readByteSerialPort(&byte) < 0) {
+                        printf("ERROR: Failed to read byte from serial port\n");
+                        return -1;
+                    }
+                    switch (state) {
+                        case START:
+                            if (byte == FLAG) state = FLAG_RCV;
+                            break;
+                        case FLAG_RCV:
+                            if (byte == A_RX) state = A_RCV;
+                            else if (byte != FLAG) state = START;
+                            break;
+                        case A_RCV:
+                            if (byte == DISC) state = C_RCV;
+                            else if (byte == FLAG) state = FLAG_RCV;
+                            else state = START;
+                            break;
+                        case C_RCV:
+                            if (byte == A_RX^DISC) state = BCC_OK;
+                            else if (byte == FLAG) state = FLAG_RCV;
+                            else state = START;
+                            break;
+                        case BCC_OK:
+                            if (byte == FLAG) state = STOP;
+                            else state = START;
+                            break;
+                        default:
+                            break;
+                    }
+                }
+                if (state != STOP) {
+                    currentTransmition--;
+                }
+            }
+            break;
+    }
     int clstat = closeSerialPort();
+    if (clstat < 0) {
+        printf("ERROR: Failed to close serial port\n");
+        return -1;
+    }
     return clstat;
 }
