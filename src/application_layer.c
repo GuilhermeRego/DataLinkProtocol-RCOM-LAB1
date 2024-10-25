@@ -147,6 +147,8 @@ void applicationLayer(const char *serialPort, const char *role, int baudRate, in
         exit(-1);
     }
 
+    printf("Connection opened successfully\n");
+
     // Calls the appropriate function based on the role
     switch (linkLayer.role) {
         case LlTx:   // Transmiter
