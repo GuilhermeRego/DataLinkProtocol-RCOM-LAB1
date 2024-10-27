@@ -148,6 +148,11 @@ void applicationLayer(const char *serialPort, const char *role, int baudRate, in
     }
 
     printf("Connection opened successfully\n");
+    if (llclose(fd) < 0) exit(-1);
+    printf("Connection closed successfully\n");
+    exit(0);
+
+    //printf("Connection opened successfully\n");
 
     // Calls the appropriate function based on the role
     switch (linkLayer.role) {
@@ -233,6 +238,7 @@ void applicationLayer(const char *serialPort, const char *role, int baudRate, in
 
             // Read control packet
             while ((packetSize = llread(packet)) < 0);
+            printf("Received control packet\n");
             unsigned long int fileSize = 0;
             unsigned char *fileName;
             if ((fileName = parseControlPacket(packet, packetSize, &fileName)) == NULL) {
