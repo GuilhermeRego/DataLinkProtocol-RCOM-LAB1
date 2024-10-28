@@ -47,7 +47,9 @@ typedef enum {
     A_RCV,
     C_RCV,
     BCC_OK,
-    STOP_RCV
+    STOP_RCV,
+    FOUND_ESCAPE,
+    DATA_RCV
 } LinkLayerState;
 
 void alarmHandler(int signal) {
@@ -76,6 +78,47 @@ int writeRX(int controlField) {
         return -1;
     }
     return 0;
+}
+
+unsigned char readControlFrame() {
+    LinkLayerState state = START;
+    unsigned char byte;
+    unsigned char control;
+    while (state != STOP_RCV) {
+        if (readByteSerialPort(&byte) > 0) {
+            switch (state) {
+                case START:
+                    if (byte == FLAG) state = FLAG_RCV;
+                    break;
+                case FLAG_RCV:
+                    if (byte == A_RX) state = A_RCV;
+                    else if (byte != FLAG) state = START;
+                    break;
+                case A_RCV:
+                    if (byte == C_RR0 || byte == C_RR1 || byte == C_REJ0 || byte == C_REJ1) {
+                        state = C_RCV;
+                        control = byte;
+                    }
+                    else if (byte == FLAG) state = FLAG_RCV;
+                    else state = START;
+                    break;
+                case C_RCV:
+                    if (byte == A_RX^(byte)) state = BCC_OK;
+                    else if (byte == FLAG) state = FLAG_RCV;
+                    else state = START;
+                    break;
+                case BCC_OK:
+                    if (byte == FLAG) state = STOP_RCV;
+                    else state = START;
+                    break;
+                case STOP_RCV:
+                    break;
+                default:
+                    return -1;
+            }
+        }
+    }
+    return control;
 }
 
 ////////////////////////////////////////////////
@@ -307,41 +350,35 @@ int llwrite(const unsigned char *buf, int bufSize) {
     frame[0] = FLAG;
     frame[1] = A_TX; 
     frame[2] = C_N(tramaTx); // PLACE HOLDER FOR CONTROL FIELD
-    frame[3] = A_TX ^ frame[2]; // BCC1 WITH PLACE HOLDER CONTROL FIELD
+    frame[3] = A_TX ^ C_N(tramaTx); // BCC1 WITH PLACE HOLDER CONTROL FIELD
     memcpy(frame+4, buf, bufSize); // Copy buffer to frame
     unsigned char BCC2 = buf[0];
-    for (unsigned int i = 1 ; i < bufSize ; i++) BCC2 ^= buf[i]; // Calculate BCC2
+    for (unsigned int i = 1 ; i < bufSize ; i++)
+        BCC2 ^= buf[i]; // Calculate BCC2
     int written = 4;
 
     // Copy buffer to frame
     for (int i = 0; i < bufSize; i++) { // Stuffing
         if (buf[i] == FLAG || buf[i] == ESCAPE) {
-            if (written + 2 > MAX_PAYLOAD_SIZE) { // Check if frame buffer is full
-                printf("ERROR: Frame buffer overflow\n");
-                return -1;
-            }
+            frameSize++;
+            frame = (unsigned char *) realloc(frame, frameSize);
             frame[written++] = ESCAPE; // Current byte is replaced by ESCAPE
-            frame[written++] = buf[i] ^ STUFF; // Next byte XORed with STUFF
         }
-        else {
-            if (written + 1 > MAX_PAYLOAD_SIZE) {
-                printf("ERROR: Frame buffer overflow\n");
-                return -1;
-            }
-            frame[written++] = buf[i];
-        }
+        frame[written++] = buf[i];
     }
     frame[written++] = BCC2; // BCC2
     frame[written++] = FLAG; // End of frame
 
+
     // Write frame
     int currentTransmition = retransmissions;
-    int rejected = 0, accepted = 0;
+    int rejected;
+    int accepted;
     unsigned char byte;
 
     while (currentTransmition) { 
-        alarmTriggered = FALSE;
         alarm(timeout);
+        alarmTriggered = FALSE;
         rejected = FALSE;
         accepted = FALSE;
 
@@ -352,32 +389,24 @@ int llwrite(const unsigned char *buf, int bufSize) {
                 printf("ERROR: Failed to write frame\n");
                 return -1;
             }
-            //Nunca consegue ter uma respota: Rx não está a enviar nada
 
             // Wait for response
-            unsigned char result = readByteSerialPort(&byte);
-            printf("Received byte: %x\n", result);
-            
-            // Check if the response is valid and if it's a RR or REJ
-            if(!result) {
-                printf("ERROR: Failed to read byte from serial port\n");
-                continue;
-            }
-
+            byte = readControlFrame();
+            //printf("Received byte: %x\n", byte);
+                
             // Accepted
-            else if (result == C_RR0 || result == C_RR1) {
-                printf("Frame accepted\n");
+            if (byte == C_RR0 || byte == C_RR1) {
+                //printf("Frame accepted\n");
                 accepted = TRUE;
                 tramaTx = (tramaTx+1) % 2;
             }
 
             // Rejected
-            else if (result == C_REJ0 || result == C_REJ1) {
-                printf("Frame rejected\n");
+            else if (byte == C_REJ0 || byte == C_REJ1) {
+                //printf("Frame rejected\n");
                 rejected = TRUE;
             }
             else continue;
-
         }
         if (accepted) break;
         currentTransmition--;
@@ -385,7 +414,7 @@ int llwrite(const unsigned char *buf, int bufSize) {
     
     free(frame);
     if (accepted) {
-        printf("Frame sent successfully\n");
+        //printf("Frame sent successfully\n");
         return bufSize;
     }
     else {
@@ -405,76 +434,97 @@ int llread(unsigned char *packet)
         return -1;
     }
     unsigned char byte;
+    unsigned char control;
     LinkLayerState state = START;
-    unsigned char *frame = (unsigned char *) malloc(MAX_PAYLOAD_SIZE);
-    int frameSize = 0;
-    int accepted = FALSE;
-    int rejected = FALSE;
-    int currentTransmition = retransmissions;
-    while (currentTransmition && !accepted) {
-        alarmTriggered = FALSE;
-        alarm(timeout);
-        rejected = FALSE;
-        accepted = FALSE;
-        while (alarmTriggered == FALSE && !rejected && !accepted) {
-            if (readByteSerialPort(&byte) < 0) {
-                printf("ERROR: Failed to read byte from serial port\n");
-                return -1;
-            }
+    int i = 0;
+    while (state != STOP_RCV) {
+        if (readByteSerialPort(&byte) > 0) {
             switch (state) {
                 case START:
-                    if (byte == FLAG) state = FLAG_RCV;
-                    break;
-                case FLAG_RCV:
-                    if (byte == A_TX) state = A_RCV;
-                    else if (byte != FLAG) state = START;
-                    break;
-                case A_RCV:
-                    if (byte == 0x00 || byte == 0x01) {
-                        frame[0] = byte;
-                        state = C_RCV;
-                    }
-                    else if (byte == FLAG) state = FLAG_RCV;
-                    else state = START;
-                    break;
-                case C_RCV:
-                    if (byte == A_TX^frame[0]) state = BCC_OK;
-                    else if (byte == FLAG) state = FLAG_RCV;
-                    else state = START;
-                    break;
-                case BCC_OK:
                     if (byte == FLAG) {
-                        frameSize--;
-                        accepted = TRUE;
-                    }
-                    else if (byte == ESCAPE) state = ESCAPE;
-                    else {
-                        frame[frameSize++] = byte;
+                        state = FLAG_RCV;
                     }
                     break;
-                case ESCAPE:
-                    frame[frameSize++] = byte ^ STUFF;
-                    state = BCC_OK;
+
+                case FLAG_RCV:
+                    if (byte == A_TX) {
+                        state = A_RCV;
+                    }
+                    else if (byte != FLAG) {
+                        state = START;
+                    }
+                    break;
+
+                case A_RCV:
+                    if (byte == C_N(tramaRx) || byte == C_N(tramaTx)) {
+                        state = C_RCV;
+                        control = byte;
+                    }
+                    else if (byte == FLAG) {
+                        state = FLAG_RCV;
+                    }
+                    else if (byte == DISC) {
+                        writeRX(DISC);
+                        return 0;
+                    }
+                    else{
+                        state = START;
+                    }
+                    break;
+
+                case C_RCV:
+                    if (byte == control^A_TX) {
+                        state = DATA_RCV;
+                    }
+                    else if (byte == FLAG) {
+                        state = FLAG_RCV;
+                    }
+                    else {
+                        state = START;
+                    }
+                    break;
+                
+                case FOUND_ESCAPE: 
+                    if (byte == ESCAPE || byte == FLAG) {
+                         state = DATA_RCV;
+                         packet[i++] = byte;
+                    }
+                    else {
+                        state = DATA_RCV;
+                        packet[i++] = ESCAPE;
+                        packet[i++] = byte;
+                    }
+                    break;
+
+                case DATA_RCV:
+                    if (byte == FLAG) {
+                        unsigned char BCC2 = packet[--i];
+                        packet[i] = '\0';
+                        unsigned char BCC2_calc = packet[0];
+                        for (int j = 1; j < i; j++) BCC2_calc ^= packet[j];
+                        if (BCC2 == BCC2_calc) {
+                            writeRX(C_RR0);
+                            tramaRx = (tramaRx+1) % 2;
+                            return i;
+                        }
+                        else {
+                            writeRX(C_REJ0);
+                            return -1;
+                        }
+                    }
+                    else if (byte == ESCAPE) {
+                        state = FOUND_ESCAPE;
+                    }
+                    else {
+                        packet[i++] = byte;
+                    }
                     break;
                 default:
                     break;
             }
         }
-        if (accepted) break;
-        currentTransmition--;
     }
-    if (accepted) {
-        for (int i = 0; i < frameSize; i++) {
-            packet[i] = frame[i];
-        }
-        free(frame);
-        return frameSize;
-    }
-    else {
-        free(frame);
-        return -1;
-    }
-    return frameSize;
+    return -1;
 }
 
 ////////////////////////////////////////////////

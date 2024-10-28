@@ -8,7 +8,7 @@
 
 unsigned char *readFile(const char *filename, int *fileSize) {
     // Open file
-    FILE *file = fopen(filename, "rb");
+    FILE *file = fopen(filename, "r");
     if (file == NULL) {
         perror("ERROR: Failed to open file\n");
         return NULL;
@@ -52,7 +52,7 @@ unsigned char *getData(unsigned char* fileData, int fileSize) {
     return data;
 }
 
-unsigned char * getControlPacket (int controlField, int fileSize, char *fileName, int *packetSize) {
+unsigned char *getControlPacket(int controlField, int fileSize, char *fileName, int *packetSize) {
     // Calculate L1 and L2
     int L1 = 0;
     int tempFileSize = fileSize;
@@ -97,7 +97,7 @@ unsigned char *getDataPacket(int sequenceNumber, int dataSize, unsigned char *da
     return packet;
 }
 
-unsigned char *parseControlPacket(unsigned char *packet, int packetSize, unsigned long int *fileSize) {
+char *parseControlPacket(unsigned char *packet, int packetSize, unsigned long int *fileSize) {
     // Check if packet is valid
     if (packet == NULL || fileSize == NULL) {
         printf("ERROR: Invalid arguments\n");
@@ -116,6 +116,7 @@ unsigned char *parseControlPacket(unsigned char *packet, int packetSize, unsigne
     unsigned char nameSize = packet[3 + nbytes];
     unsigned char *name = (unsigned char *) malloc(nameSize);
     memcpy(name, packet + 5 + nbytes, nameSize);
+
     return name;
 }
 
@@ -129,7 +130,6 @@ void parseDataPacket(unsigned char *packet, int packetSize, int *buffer) {
     memcpy(buffer, packet + 4, packetSize - 4);
     buffer += packetSize + 4;
 }
-
 
 void applicationLayer(const char *serialPort, const char *role, int baudRate, int nTries, int timeout, const char *filename) {
     // Completes the link layer struct
@@ -147,16 +147,11 @@ void applicationLayer(const char *serialPort, const char *role, int baudRate, in
         exit(-1);
     }
 
-    printf("Connection opened successfully\n");
-    if (llclose(fd) < 0) exit(-1);
-    printf("Connection closed successfully\n");
-    exit(0);
-
     //printf("Connection opened successfully\n");
 
     // Calls the appropriate function based on the role
     switch (linkLayer.role) {
-        case LlTx:   // Transmiter
+        case LlTx:   {// Transmiter
             
             // Read file
             int fileSize;
@@ -169,16 +164,18 @@ void applicationLayer(const char *serialPort, const char *role, int baudRate, in
             // Get start control packet
             int packetSize;
             unsigned char *startPacket;
-            if ((startPacket = getControlPacket(0x01, fileSize, filename, &packetSize)) == NULL) {
+            if ((startPacket = getControlPacket(0x02, fileSize, filename, &packetSize)) == NULL) {
                 perror("ERROR: getControlPacket\n");
                 exit(-1);
             }
 
+            //printf("Sending packet...\n");
             // Send control packet
             if (llwrite(startPacket, packetSize) < 0) {
                 perror("ERROR: llwrite\n");
                 exit(-1);
             }
+            //printf("File sent successfully\n");
 
             // Send data packet
             int sequenceNumber = 0;
@@ -187,13 +184,11 @@ void applicationLayer(const char *serialPort, const char *role, int baudRate, in
                 perror("ERROR: getData\n");
                 exit(-1);
             }
-
+            
             int writtenBytes = 0;
-            while (writtenBytes <= fileSize) {
-                
+            while (writtenBytes < fileSize) {
                 // Calculate bytes to write
                 int bytesToWrite = fileSize - writtenBytes > MAX_PAYLOAD_SIZE ? MAX_PAYLOAD_SIZE : fileSize - writtenBytes;
-                
                 // Copy data to send
                 *data = (unsigned char *) malloc(bytesToWrite);
                 memcpy(data, fileData + writtenBytes, bytesToWrite);
@@ -212,6 +207,7 @@ void applicationLayer(const char *serialPort, const char *role, int baudRate, in
                     exit(-1);
                 }
                 writtenBytes += bytesToWrite;
+                //printf("Written bytes: %d | Bytes to Write: %d\n | File size: %d", writtenBytes, bytesToWrite, fileSize);
             }
 
             // Get end control packet
@@ -227,37 +223,50 @@ void applicationLayer(const char *serialPort, const char *role, int baudRate, in
                 exit(-1);
             }
 
-            llclose(fd);
+            if (llclose(fd) < 0) {
+                perror("ERROR: llclose\n");
+                exit(-1);
+            }
             break;
+        }
 
         case LlRx: {  // Receiver
 
             // Create space for control packet
             unsigned char *packet = (unsigned char *) malloc(MAX_PAYLOAD_SIZE);
-            int packetSize = 0;
+            int packetSize = -1;
 
             // Read control packet
             while ((packetSize = llread(packet)) < 0);
-            printf("Received control packet\n");
+
+            printf("Control packet: %x\n", packet[0]);
+            if (packet[0] != 0x02) {
+                perror("ERROR: Invalid control packet\n");
+                exit(-1);
+            }
+            else writeRX(0xAA);
+            printf("Writing RR\n");
+
             unsigned long int fileSize = 0;
             unsigned char *fileName;
-            if ((fileName = parseControlPacket(packet, packetSize, &fileName)) == NULL) {
+            if ((fileName = parseControlPacket(packet, packetSize, &fileSize)) == NULL) {
                 perror("ERROR: getControlPacket\n");
                 exit(-1);
             }
 
             // Create file
-            FILE *file = fopen(fileName, "wb");
+            FILE *file = fopen((char *)fileName, "wb+");
             if (file == NULL) {
                 perror("ERROR: Failed to create file\n");
                 exit(-1);
             }
+
             // While there are packets to read
             while (TRUE) {
                 // Wait for packet and read it
                 while ((packetSize = llread(packet)) < 0);
                 // Check if it is the end control packet
-                if(packetSize == 0) break;
+                if(!packetSize) break;
                 // Check if it is a data packet
                 else if(packet[0] != 3){
                     unsigned char *buffer = (unsigned char*)malloc(packetSize);
@@ -268,13 +277,13 @@ void applicationLayer(const char *serialPort, const char *role, int baudRate, in
                 else continue;
             }
 
+            printf("File received successfully\n");
+
             fclose(file);
             break;
         }
-    }
-    
-    if (llclose(0) < 0) {
-        perror("ERROR: llclose\n");
-        exit(-1);
+
+        default:
+            exit(-1);
     }
 }
