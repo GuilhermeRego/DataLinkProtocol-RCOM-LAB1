@@ -339,13 +339,13 @@ int llopen(LinkLayer connectionParameters) {
 ////////////////////////////////////////////////
 int llwrite(const unsigned char *buf, int bufSize) {
     // Check if buffer is empty
-    if (buf == NULL || bufSize <= 0 || bufSize > MAX_PAYLOAD_SIZE) {
+    if (buf == NULL || bufSize <= 0) {
         printf("ERROR: Invalid buffer\n");
         return -1;
     }
 
     // Create frame
-    int frameSize = 6+bufSize;
+    int frameSize = 6+bufSize*2;
     unsigned char *frame = (unsigned char *) malloc(frameSize);
     frame[0] = FLAG;
     frame[1] = A_TX; 
@@ -357,10 +357,8 @@ int llwrite(const unsigned char *buf, int bufSize) {
         BCC2 ^= buf[i]; // Calculate BCC2
     int written = 4;
 
-    // Copy buffer to frame
     for (int i = 0; i < bufSize; i++) { // Stuffing
         if (buf[i] == FLAG || buf[i] == ESCAPE) {
-            frameSize++;
             frame = (unsigned char *) realloc(frame, frameSize);
             frame[written++] = ESCAPE; // Current byte is replaced by ESCAPE
         }
@@ -503,12 +501,17 @@ int llread(unsigned char *packet)
                         unsigned char BCC2_calc = packet[0];
                         for (int j = 1; j < i; j++) BCC2_calc ^= packet[j];
                         if (BCC2 == BCC2_calc) {
-                            writeRX(C_RR0);
-                            tramaRx = (tramaRx+1) % 2;
+                            if (control == C_N(tramaRx))
+                                writeRX(C_RR0);
+                            else
+                                writeRX(C_RR1);
                             return i;
                         }
                         else {
-                            writeRX(C_REJ0);
+                            if (control == C_N(tramaRx))
+                                writeRX(C_REJ0);
+                            else
+                                writeRX(C_REJ1);
                             return -1;
                         }
                     }
