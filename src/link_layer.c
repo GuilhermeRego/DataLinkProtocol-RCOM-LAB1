@@ -165,7 +165,7 @@ int llopen(LinkLayer connectionParameters) {
                 //printf("Alarm #%d\n", alarmCount);
                 alarm(connectionParameters.timeout);
                 alarmTriggered = FALSE;
-                printf("SET sent: %x\n", C_SET);
+                //printf("SET sent: %x\n", C_SET);
                 // Wait for UA
                 while (state != STOP_RCV && alarmTriggered == FALSE) {
                     //printf("Waiting for byte...\n");
