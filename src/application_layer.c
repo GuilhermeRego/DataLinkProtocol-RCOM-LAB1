@@ -12,6 +12,8 @@
 #define dataPacket 0x02
 #define endPacket 0x03
 
+extern int rejected;
+
 // Update progress bar
 void updateProgressBar(int bytesWritten, int fileSize) {
     int progressBarWidth = 50;
@@ -124,8 +126,13 @@ int sendDataPacket(unsigned char *buffer, int contentSize) {
         if ((result = llwrite(packet, packetSize)) > 0) {
             break;
         }
-        else if (result < 0) {
-            printf("Received REJ, resending packet...\n");
+        else if (result <= 0) {
+            if (rejected) {
+                printf("\nReceived REJ, resending packet...\n");
+            }
+            else {
+                printf("\nExceeded number of retransmissions, aborting...\n");
+            }
             return -1;
         }
     }
@@ -176,7 +183,7 @@ void applicationLayer(const char *serialPort, const char *role, int baudRate, in
             printf("Start packet Successfully sent!\n");
 
             // Send Data Packets
-            unsigned char* buf = (unsigned char*)malloc(MAX_PAYLOAD_SIZE-3);
+            unsigned char* buf = (unsigned char*) malloc(MAX_PAYLOAD_SIZE-3);
             int contentSize;
             int bytesWritten = 0;
             while (TRUE) {
@@ -187,8 +194,14 @@ void applicationLayer(const char *serialPort, const char *role, int baudRate, in
                 }
 
                 if (sendDataPacket(buf, contentSize) < 0) {
-                    fseek(file, -contentSize, SEEK_CUR);
-                    printf("Resending the same content block due to failed transmission.\n");
+                    if (rejected) {
+                        fseek(file, -contentSize, SEEK_CUR);
+                        printf("Resending the same content block due to failed transmission.\n");
+                    }
+                    else {
+                        printf("Exceeded number of retransmissions, aborting...\n");
+                        exit(-1);
+                    }
                 }
 
                 else {

@@ -52,6 +52,7 @@ typedef enum {
 int alarmTriggered = FALSE;
 int alarmCount = 0;
 int fd = 0;
+int rejected = FALSE;
 
 unsigned char tramaTx = 0;
 unsigned char tramaRx = 0;
@@ -389,13 +390,11 @@ int llwrite(const unsigned char *buf, int bufSize) {
     // Send frame
     int currentTransmission = retransmissions;
     int accepted = FALSE;
-    int rejected = FALSE;
     alarmTriggered = FALSE;
     alarmCount = 0;
     (void) signal(SIGALRM, alarmHandler);
 
-    while (currentTransmission && !accepted) {
-        printf("Sending frame...\n");
+    while (currentTransmission && !accepted && !rejected) {
         if (writeBytesSerialPort(frame, frameSize) < 0) {
             perror("ERROR: Error on writing to serial port. (3)\n");
         }
@@ -405,9 +404,7 @@ int llwrite(const unsigned char *buf, int bufSize) {
         alarm(timeout);
 
         while (!alarmTriggered && !accepted && !rejected) {
-            printf("wedawdawd\n");
             unsigned char response = readControlFrame();
-            printf("PASSOU\n");
 
             if (response == C_RR0 || response == C_RR1) {
                 accepted = TRUE;
@@ -436,14 +433,7 @@ int llwrite(const unsigned char *buf, int bufSize) {
         return frameSize;
     }
     else {
-        if (rejected) {
-            printf("The frame was rejected\n");
-            return -1;
-        }
-        else {
-            printf("The program exceeded the number of retransmissions\n");
-            return -1;
-        }
+        return -1;
     }
 }
 
