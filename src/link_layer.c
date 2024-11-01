@@ -1,450 +1,473 @@
 // Link layer protocol implementation
 
 #include "link_layer.h"
-#include "serial_port.h"
-#include "signal.h"
 
 #include <stdio.h>
-#include <stdlib.h>
 #include <string.h>
+#include <stdlib.h>
+#include <signal.h>
 
-// MISC
-#define _POSIX_SOURCE 1 // POSIX compliant source
-#define ESCAPE 0x7D
-#define STUFF 0x20
-
-// Receiver's response control fields to inform transmitter of the received frame
-#define C_RR0 0xAA
-#define C_RR1 0xAB
-#define C_REJ0 0x54
-#define C_REJ1 0x55
-
-#define FLAG 0x7E 
-#define A_TX 0x03 // Transmitter
-#define A_RX 0x01 // Receiver
-
-// Supervision control fields
-#define C_SET 0x03 // Transmitter
-#define C_UA 0x07 // Receiver
-
-#define DISC 0x0B
-
-#define C_N(x) (x << 6)
-
-int timeout = 0;
-int retransmissions = 0;
-LinkLayerRole role;
-
-int alarmTriggered = FALSE;
-int alarmCount = 0;
-
-unsigned char tramaTx = 0;
-unsigned char tramaRx = 1;
-
+// State machine states
 typedef enum {
     START,
     FLAG_RCV,
     A_RCV,
     C_RCV,
     BCC_OK,
-    STOP_RCV,
-    FOUND_ESCAPE,
-    DATA_RCV
+    DATA_RCV,
+    FOUND_DATA,
+    STOP
 } LinkLayerState;
 
-void alarmHandler(int signal) {
+// MISC
+#define _POSIX_SOURCE 1 // POSIX compliant source
+
+// Frame delimiters: Page 10 of the protocol
+#define FLAG 0x7E
+
+// Address field: Pages 10 and 11 of the protocol
+#define A_TX 0x03
+#define A_RX 0x01
+
+// Control field for Supervision and Unnumbered frames: Page 10 of the protocol
+#define C_SET 0x03      // Set up connection: Tx
+#define C_UA 0x07       // Unnumbered acknowledgment: Rx
+#define C_RR0 0xAA      // Receiver ready 0: Rx
+#define C_RR1 0xAB      // Receiver ready 1: Rx
+#define C_REJ0 0x54     // Reject 0: Rx
+#define C_REJ1 0x55     // Reject 1: Rx
+#define C_DISC 0x0B     // Disconnect: Tx | Rx
+
+// Control field for Information frames: Page 11 of the protocol
+#define C_N0 0x00       // Information frame control field (frame 0)
+#define C_N1 0x80       // Information frame control field (frame 1)
+#define TX 0            // Transmitter
+#define RX 1            // Receiver
+
+// Byte stuffing: Page 17 of the protocol
+#define ESCAPE 0x7D     // Escape character
+#define STUFF 0x20      // XOR value for byte stuffing
+
+// Global variables
+int alarmTriggered = FALSE;
+int alarmCount = 0;
+int fd = 0;
+
+unsigned char tramaTx = 0;
+unsigned char tramaRx = 0;
+
+int framesSent, framesReceived = 0;
+time_t startTime, startTimeConnection, endTime;
+
+
+// Alarm function handler
+void alarmHandler(int signal){
     alarmTriggered = TRUE;
     alarmCount++;
     printf("Alarm #%d\n", alarmCount);
 }
 
-// Send supervision frame (SET | DISC) - Transmitter
-int writeTX(int controlField) {
-    unsigned char supervision[5] = {FLAG, A_TX, controlField, A_TX^controlField, FLAG};
-    // Write frame
-    if (writeBytesSerialPort(supervision, 5) < 0) {
-        printf("ERROR: Failed to write frame\n");
-        return -1;
-    }
-    return 0;
-}
+int retransmissions;
+int timeout;
+LinkLayerRole role;
 
-
-// Send supervision frame (DISC | UA | RR | REJ) - Receiver
-int writeRX(int controlField) {
-    unsigned char supervision[5] = {FLAG, A_RX, controlField, A_RX^controlField, FLAG};
-    if (writeBytesSerialPort(supervision, 5) < 0) {
-        printf("ERROR: Failed to write frame\n");
-        return -1;
-    }
-    return 0;
-}
-
+// Auxiliar function to make Tx receive the Rx's response (RR or REJ)
 unsigned char readControlFrame() {
-    LinkLayerState state = START;
     unsigned char byte;
-    unsigned char control;
-    while (state != STOP_RCV) {
-        if (readByteSerialPort(&byte) > 0) {
-            switch (state) {
-                case START:
-                    if (byte == FLAG) state = FLAG_RCV;
-                    break;
-                case FLAG_RCV:
-                    if (byte == A_RX) state = A_RCV;
-                    else if (byte != FLAG) state = START;
-                    break;
-                case A_RCV:
-                    if (byte == C_RR0 || byte == C_RR1 || byte == C_REJ0 || byte == C_REJ1) {
-                        state = C_RCV;
-                        control = byte;
+    unsigned char response;
+    LinkLayerState state = START;
+    int result;
+
+    while(state != STOP){
+        result = readByteSerialPort(&byte, 1);
+        if (result > 0) {
+            switch (state){
+                case START: {
+                    if (byte == FLAG) {
+                        state = FLAG_RCV;
                     }
-                    else if (byte == FLAG) state = FLAG_RCV;
-                    else state = START;
                     break;
-                case C_RCV:
-                    if (byte == A_RX^(byte)) state = BCC_OK;
-                    else if (byte == FLAG) state = FLAG_RCV;
-                    else state = START;
+                }
+
+                case FLAG_RCV: {
+                    if (byte == A_RX) {
+                        state = A_RCV;
+                    } else if (byte != FLAG) {
+                        state = START;
+                    }
                     break;
-                case BCC_OK:
-                    if (byte == FLAG) state = STOP_RCV;
-                    else state = START;
+                }
+
+                case A_RCV: {
+                    if (byte == C_RR0 || byte == C_RR1 || byte == C_REJ0 || byte == C_REJ1 || byte == C_DISC) {
+                        state = C_RCV;
+                        response = byte;
+                    } else if (byte == FLAG) {
+                        state = FLAG_RCV;
+                    } else {
+                        state = START;
+                    }
                     break;
-                case STOP_RCV:
+                }
+
+                case C_RCV: {
+                    if (byte == (A_RX ^ response)) {
+                        state = BCC_OK;
+                    } else if (byte == FLAG) {
+                        state = FLAG_RCV;
+                    } else {
+                        state = START;
+                    }
                     break;
+                }
+
+                case BCC_OK: {
+                    if (byte == FLAG) {
+                        framesReceived++;
+                        state = STOP;
+                    } else {
+                        state = START;
+                    }
+                    break;
+                }
+
+                case STOP: {
+                    break;
+                }
+
                 default:
                     return -1;
             }
         }
     }
-    return control;
+
+    return response;
 }
 
 ////////////////////////////////////////////////
 // LLOPEN
 ////////////////////////////////////////////////
-int llopen(LinkLayer connectionParameters) {
-    if (connectionParameters.serialPort == NULL || connectionParameters.baudRate <= 0) {
-        printf("ERROR: Invalid connection parameters\n");
-        return -1;
-    }
-
-    //printf("Opening serial port...\n");
+int llopen(LinkLayer connectionParameters){
+    time(&startTime);
 
     // Open serial port
-    int fd = openSerialPort(connectionParameters.serialPort, connectionParameters.baudRate);
+    fd = openSerialPort(connectionParameters.serialPort, connectionParameters.baudRate);
     if (fd < 0) {
-        printf("ERROR: Failed to open serial port\n");
         return -1;
     }
-    //printf("Serial port opened successfully\n");
 
-    // Set connection parameters
-    timeout = connectionParameters.timeout;
+    // Set global variables
     retransmissions = connectionParameters.nRetransmissions;
+    timeout = connectionParameters.timeout;
     role = connectionParameters.role;
 
-    LinkLayerState state = START;
-    unsigned char byte;
-    int currentTransmition = retransmissions;
-
     // Establish connection
-    switch (connectionParameters.role) {
-        case LlTx: { // Transmitter     
-            // Install alarm handler
+    int currentTransmission = retransmissions;
+    LinkLayerState state = START;
+    switch (role) {
+        case LlTx: {
+            // Set alarm handler
             (void) signal(SIGALRM, alarmHandler);
-            while (currentTransmition && state != STOP_RCV) {
-                //printf("Trying to establish connection...\n");
-                // Send SET
-                if (writeTX(C_SET) < 0) {
-                    printf("ERROR: Failed to send SET\n");
-                    return -1;
+            alarmTriggered = FALSE;
+
+            // Send SET frame
+            unsigned char frame_set[5] = {FLAG, A_TX, C_SET, (A_TX ^ C_SET), FLAG};
+            while (currentTransmission && state != STOP) {
+                if (writeBytesSerialPort(frame_set, 5) < 0) {
+                    perror("ERROR: Error on writing to serial port. (1)\n");
                 }
-                // Set alarm 
-                //printf("Alarm #%d\n", alarmCount);
-                alarm(connectionParameters.timeout);
+                framesSent++;
                 alarmTriggered = FALSE;
-                //printf("SET sent: %x\n", C_SET);
-                // Wait for UA
-                while (state != STOP_RCV && alarmTriggered == FALSE) {
-                    //printf("Waiting for byte...\n");
-                    if (readByteSerialPort(&byte) > 0) { 
-                        //printf("Received byte: %x\n", byte);
+                alarm(timeout);
+                while (!alarmTriggered && state != STOP) {
+                    // Read UA frame
+                    unsigned char byte;
+                    int result;
+                    result = readByteSerialPort(&byte, 1);
+                    if (result > 0) {
                         switch (state) {
                             case START:
                                 if (byte == FLAG) {
                                     state = FLAG_RCV;
-                                    //printf("FLAG OK!\n");
                                 }
                                 break;
 
                             case FLAG_RCV:
                                 if (byte == A_RX) {
                                     state = A_RCV;
-                                    //printf("A OK!\n");
                                 }
                                 else if (byte != FLAG) {
                                     state = START;
-                                    //printf("NOT SUPPOSED TO BE FLAG!\n");
                                 }
                                 break;
 
                             case A_RCV:
                                 if (byte == C_UA) {
                                     state = C_RCV;
-                                    //printf("C OK!\n");
                                 }
                                 else if (byte == FLAG) {
                                     state = FLAG_RCV;
-                                    //printf("FLAG OK!\n");
                                 }
                                 else {
                                     state = START;
-                                    //printf("NOT SUPPOSED TO BE FLAG!\n");
                                 }
                                 break;
 
                             case C_RCV:
-                                if (byte == A_RX^C_UA) {
+                                if (byte == (C_UA ^ A_RX)) {
                                     state = BCC_OK;
-                                    //printf("BCC OK!\n");
                                 }
                                 else if (byte == FLAG) {
                                     state = FLAG_RCV;
-                                    //printf("FLAG OK!\n");
                                 }
                                 else {
                                     state = START;
-                                    //printf("NOT SUPPOSED TO BE FLAG!\n");
                                 }
                                 break;
 
                             case BCC_OK:
                                 if (byte == FLAG) {
-                                    state = STOP_RCV;
-                                    //printf("STOP OK!\n");
+                                    state = STOP;
                                 }
                                 else {
                                     state = START;
-                                    //printf("NOT SUPPOSED TO BE FLAG!\n");
                                 }
                                 break;
-                            
+
+                            case STOP: {
+                                framesReceived++;
+                                break;
+                            }
+
                             default:
                                 break;
                         }
                     }
                 }
-                currentTransmition--;
+                if (state == STOP) {
+                    break;
+                }
+                currentTransmission--;
             }
-            // If we didn't reached the STOP state (didn't received UA), we failed to establish connection
-            if (state != STOP_RCV) {
-                printf("ERROR: Failed to establish connection\n");
+
+            // Reached maximum number of retransmissions
+            if (state != STOP) {
                 return -1;
             }
-            alarm(0);
+
+
             break;
         }
 
-        case LlRx: { // Receiver
-            // Wait for SET
-            while (state != STOP_RCV) {
-                //printf("Waiting for byte...\n");
-                if (readByteSerialPort(&byte) > 0) {
-                    //printf("Received byte: %x\n", byte);
+        case LlRx: {
+            // Read SET frame
+            unsigned char byte;
+            int result;
+            while (state != STOP) {
+                result = readByteSerialPort(&byte, 1);
+                if (result > 0) {
                     switch (state) {
-                        case START:
+                        case START: {
                             if (byte == FLAG) {
                                 state = FLAG_RCV;
-                                //printf("FLAG OK!\n");
                             }
                             break;
+                        }
 
-                        case FLAG_RCV:
+                        case FLAG_RCV: {
                             if (byte == A_TX) {
                                 state = A_RCV;
-                                //printf("A OK!\n");
                             }
                             else if (byte != FLAG) {
                                 state = START;
-                                //printf("NOT SUPPOSED TO BE FLAG!\n");
                             }
                             break;
+                        }
 
-                        case A_RCV:
+                        case A_RCV: {
                             if (byte == C_SET) {
                                 state = C_RCV;
-                                //printf("C OK!\n");
                             }
                             else if (byte == FLAG) {
                                 state = FLAG_RCV;
-                                //printf("FLAG OK!\n");
                             }
                             else {
                                 state = START;
-                                //printf("NOT SUPPOSED TO BE FLAG!\n");
                             }
                             break;
+                        }
 
-                        case C_RCV:
-                            if (byte == A_TX^C_SET) {
+                        case C_RCV: {
+                            if (byte == (C_SET ^ A_TX)) {
                                 state = BCC_OK;
-                                //printf("BCC OK!\n");
                             }
                             else if (byte == FLAG) {
                                 state = FLAG_RCV;
-                                //printf("FLAG OK!\n");
                             }
                             else {
                                 state = START;
-                                //printf("NOT SUPPOSED TO BE FLAG!\n");
                             }
                             break;
+                        }
 
-                        case BCC_OK:
+                        case BCC_OK: {
                             if (byte == FLAG) {
-                                state = STOP_RCV;
-                                //printf("STOP OK!\n");
-                            }
-                            else {
+                                framesReceived++;
+                                state = STOP;
+                            } else {
                                 state = START;
-                                //printf("NOT SUPPOSED TO BE FLAG!\n");
                             }
                             break;
-                        
+                        }
+
+                        case STOP: {
+                            break;
+                        }
+
                         default:
                             break;
                     }
                 }
             }
-            // If everything went well, send UA
-            if (writeRX(C_UA) < 0) {
-                printf("ERROR: Failed to send UA\n");
-                return -1;
-            }
 
+
+            unsigned char frame[5] = {FLAG, A_RX, C_UA, (A_RX ^ C_UA), FLAG};
+            if (writeBytesSerialPort(frame, 5) < 0) {
+                perror("ERROR: Error on writing to serial port. (2)\n");
+            }
             break;
         }
+
         default:
             return -1;
     }
+
+    time(&startTimeConnection); // Track time when connection was established and packet transfer started
     alarmCount = 0;
-    alarmTriggered = FALSE;
-    return fd;
+    return 1;
 }
 
 ////////////////////////////////////////////////
 // LLWRITE
 ////////////////////////////////////////////////
 int llwrite(const unsigned char *buf, int bufSize) {
-    // Check if buffer is empty
-    if (buf == NULL || bufSize <= 0) {
-        printf("ERROR: Invalid buffer\n");
-        return -1;
-    }
+    // Frame structure: | FLAG | A | C | BCC1 | D1 | D2 | ... | DN | BCC2 | FLAG 
+    // Initialize frame to write
+    int frameSize = bufSize+6;
+    unsigned char* frame = malloc(frameSize);
 
-    // Create frame
-    int frameSize = 6+bufSize*2;
-    unsigned char *frame = (unsigned char *) malloc(frameSize);
+    // Construct frame:
+    // Frame header
     frame[0] = FLAG;
-    frame[1] = A_TX; 
-    frame[2] = C_N(tramaTx); // PLACE HOLDER FOR CONTROL FIELD
-    frame[3] = A_TX ^ C_N(tramaTx); // BCC1 WITH PLACE HOLDER CONTROL FIELD
-    memcpy(frame+4, buf, bufSize); // Copy buffer to frame
-    unsigned char BCC2 = buf[0];
-    for (unsigned int i = 1 ; i < bufSize ; i++)
-        BCC2 ^= buf[i]; // Calculate BCC2
-    int written = 4;
+    frame[1] = A_TX;
+    frame[2] = (tramaTx % 2 == 0) ? C_N0 : C_N1;    // Sequence number
+    frame[3] = (A_TX ^ frame[2]);                   // BCC1
 
-    for (int i = 0; i < bufSize; i++) { // Stuffing
-        if (buf[i] == FLAG || buf[i] == ESCAPE) {
-            frame = (unsigned char *) realloc(frame, frameSize);
-            frame[written++] = ESCAPE; // Current byte is replaced by ESCAPE
-        }
-        frame[written++] = buf[i];
+    // Calculate BCC2
+    unsigned char BCC2 = 0;
+    for (int i = 0; i < bufSize; i++) {
+        BCC2 ^= buf[i];
     }
-    frame[written++] = BCC2; // BCC2
-    frame[written++] = FLAG; // End of frame
 
+    // Byte stuffing
+    int frameCount = 4;
+    for (int i = 0; i < bufSize; i++) {
+        if(buf[i] == FLAG || buf[i] == ESCAPE){
+            frame = realloc(frame, ++frameSize);
+            frame[frameCount++] = ESCAPE;
+            frame[frameCount++] = buf[i] ^ STUFF;
+        }
+        else{
+            frame[frameCount++] = buf[i];
+        }
+    }
 
-    // Write frame
-    int currentTransmition = retransmissions;
-    int rejected;
-    int accepted;
-    unsigned char byte;
+    // Finish information frame
+    frame[frameCount++] = BCC2;
+    frame[frameCount] = FLAG;
 
-    while (currentTransmition) { 
-        alarm(timeout);
+    // Send frame
+    int currentTransmission = retransmissions;
+    int accepted = FALSE;
+    int rejected = FALSE;
+    alarmTriggered = FALSE;
+    alarmCount = 0;
+    (void) signal(SIGALRM, alarmHandler);
+
+    while (currentTransmission && !accepted) {
+        printf("Sending frame...\n");
+        if (writeBytesSerialPort(frame, frameSize) < 0) {
+            perror("ERROR: Error on writing to serial port. (3)\n");
+        }
+        framesSent++;
         alarmTriggered = FALSE;
         rejected = FALSE;
-        accepted = FALSE;
+        alarm(timeout);
 
-        while (alarmTriggered == FALSE && !rejected && !accepted) {
+        while (!alarmTriggered && !accepted && !rejected) {
+            printf("wedawdawd\n");
+            unsigned char response = readControlFrame();
+            printf("PASSOU\n");
 
-            // Send frame
-            if (writeBytesSerialPort(frame, frameSize) < 0) {
-                printf("ERROR: Failed to write frame\n");
+            if (response == C_RR0 || response == C_RR1) {
+                accepted = TRUE;
+                tramaTx = (tramaTx + 1) % 2;
+                break;
+            }
+            else if (response == C_REJ0 || response == C_REJ1) {
+                alarmTriggered = FALSE;
+                rejected = TRUE;
+                break;
+            }
+            else if (response < 0) {
                 return -1;
             }
-
-            // Wait for response
-            byte = readControlFrame();
-            //printf("Received byte: %x\n", byte);
-                
-            // Accepted
-            if (byte == C_RR0 || byte == C_RR1) {
-                //printf("Frame accepted\n");
-                accepted = TRUE;
-                tramaTx = (tramaTx+1) % 2;
-            }
-
-            // Rejected
-            else if (byte == C_REJ0 || byte == C_REJ1) {
-                //printf("Frame rejected\n");
-                rejected = TRUE;
-            }
-            else continue;
         }
-        if (accepted) break;
-        currentTransmition--;
+        if (accepted || rejected) {
+            break;
+        }
+        currentTransmission--;
     }
-    
+
     free(frame);
+    alarmCount = 0;
+
     if (accepted) {
-        //printf("Frame sent successfully\n");
-        return bufSize;
+        return frameSize;
     }
     else {
-        printf("ERROR: Failed to send frame\n");
-        return -1;
+        if (rejected) {
+            printf("The frame was rejected\n");
+            return -1;
+        }
+        else {
+            printf("The program exceeded the number of retransmissions\n");
+            return -1;
+        }
     }
 }
 
 ////////////////////////////////////////////////
 // LLREAD
 ////////////////////////////////////////////////
-int llread(unsigned char *packet)
-{
-    // Check if buffer is empty
-    if (packet == NULL) {
-        printf("ERROR: Invalid buffer\n");
-        return -1;
-    }
-    unsigned char byte;
-    unsigned char control;
-    LinkLayerState state = START;
+int llread(unsigned char *packet){
+    unsigned char byte, field;
     int i = 0;
-    while (state != STOP_RCV) {
-        if (readByteSerialPort(&byte) > 0) {
-            switch (state) {
-                case START:
+    int result;
+    LinkLayerState state = START;
+    while (state != STOP) {
+        result = readByteSerialPort(&byte, 1);
+        if (result > 0) {
+            switch (state){
+                case START: {
+                    framesReceived++;
                     if (byte == FLAG) {
                         state = FLAG_RCV;
                     }
                     break;
+                }
 
-                case FLAG_RCV:
+                case FLAG_RCV: {
                     if (byte == A_TX) {
                         state = A_RCV;
                     }
@@ -452,26 +475,24 @@ int llread(unsigned char *packet)
                         state = START;
                     }
                     break;
+                }
 
-                case A_RCV:
-                    if (byte == C_N(tramaRx) || byte == C_N(tramaTx)) {
+                case A_RCV: {
+                    if (byte == C_N0 || byte == C_N1) {
                         state = C_RCV;
-                        control = byte;
+                        field = byte;
                     }
                     else if (byte == FLAG) {
                         state = FLAG_RCV;
                     }
-                    else if (byte == DISC) {
-                        writeRX(DISC);
-                        return 0;
-                    }
-                    else{
+                    else {
                         state = START;
                     }
                     break;
+                }
 
-                case C_RCV:
-                    if (byte == control^A_TX) {
+                case C_RCV: {
+                    if (byte == (field ^ A_TX)) {
                         state = DATA_RCV;
                     }
                     else if (byte == FLAG) {
@@ -481,246 +502,286 @@ int llread(unsigned char *packet)
                         state = START;
                     }
                     break;
-                
-                case FOUND_ESCAPE: 
-                    if (byte == ESCAPE || byte == FLAG) {
-                         state = DATA_RCV;
-                         packet[i++] = byte;
-                    }
-                    else {
-                        state = DATA_RCV;
-                        packet[i++] = ESCAPE;
-                        packet[i++] = byte;
-                    }
-                    break;
+                }
 
-                case DATA_RCV:
-                    if (byte == FLAG) {
-                        unsigned char BCC2 = packet[--i];
+                case DATA_RCV: {
+                    if (byte == ESCAPE) {
+                        state = FOUND_DATA;
+                    }
+                    else if (byte == FLAG) {
+                        // Check BCC2
+                        unsigned char BCC2 = packet[i - 1];
+                        i--;
                         packet[i] = '\0';
-                        unsigned char BCC2_calc = packet[0];
-                        for (int j = 1; j < i; j++) BCC2_calc ^= packet[j];
-                        if (BCC2 == BCC2_calc) {
-                            if (control == C_N(tramaRx))
-                                writeRX(C_RR0);
-                            else
-                                writeRX(C_RR1);
+                        unsigned char check = packet[0];
+
+                        // Calculate BCC2
+                        for (unsigned int j = 1; j < i; j++) {
+                            check ^= packet[j];
+                        }
+
+                        // If BCC2 is correct, send RR
+                        if (BCC2 == check) {
+                            int c;
+                            c = tramaRx % 2 == 0 ? C_RR0 : C_RR1;
+                            unsigned char frame[5] = {FLAG, A_RX, c, (A_RX ^ c), FLAG};
+                            if (writeBytesSerialPort(frame, 5) < 0) {
+                                perror("ERROR: Error on writing to serial port. (4)\n");
+                            }
+                            framesSent++;
+                            if ((tramaRx % 2 == 0 && field == C_N0) || (tramaRx % 2 == 1 && field == C_N1)) {
+                                tramaRx = (tramaRx + 1) % 2;
+                            }
+                            else {
+                                i = 0;
+                            }
                             return i;
                         }
+
+                        // If BCC2 is incorrect, send REJ
                         else {
-                            if (control == C_N(tramaRx))
-                                writeRX(C_REJ0);
-                            else
-                                writeRX(C_REJ1);
-                            return -1;
+                            int c;
+                            if (tramaRx % 2 == 0) c = C_REJ0;
+                            else c = C_REJ1;
+                            unsigned char frame[5] = {FLAG, A_RX, c, (A_RX ^ c), FLAG};
+                            if (writeBytesSerialPort(frame, 5) < 0) {
+                                perror("ERROR: Error on writing to serial port. (5)\n");
+                            }
+                            framesSent++;
+                            state = START;
+                            i = 0;
+                            continue;
                         }
+
                     }
-                    else if (byte == ESCAPE) {
-                        state = FOUND_ESCAPE;
-                    }
+
+                    // Data
                     else {
                         packet[i++] = byte;
                     }
                     break;
-                default:
+                }
+
+                case FOUND_DATA: {
+                    state = DATA_RCV;
+                    packet[i++] = byte ^ STUFF;
                     break;
+                }
             }
         }
     }
-    return -1;
+}
+
+void printStats(role) {
+    switch (role) {
+        case LlTx:
+            printf("\n");
+            printf("╔════════════════════════════════════════════════════════╗\n");
+            printf("║      Displaying Statistics for Transmitter (LlTx)      ║\n");
+            printf("╠═════════════════════════╦══════════════════════════════╣\n");
+            printf("║      Total Runtime      ║     %10ld seconds       ║\n", endTime - startTime);
+            printf("╠═════════════════════════╬══════════════════════════════╣\n");
+            printf("║       Frames Sent       ║     %10d               ║\n", framesSent);
+            printf("╠═════════════════════════╬══════════════════════════════╣\n");
+            printf("║     Frames Received     ║     %10d               ║\n", framesReceived);
+            printf("╠═════════════════════════╬══════════════════════════════╣\n");
+            printf("║    Data Transfer Time   ║     %10ld seconds       ║\n", endTime - startTimeConnection);
+            printf("╚═════════════════════════╩══════════════════════════════╝\n\n");
+            break;
+
+        case LlRx:
+            printf("\n");
+            printf("╔════════════════════════════════════════════════════════╗\n");
+            printf("║     Displaying Statistics for Receiver (LlRx)          ║\n");
+            printf("╠═════════════════════════╦══════════════════════════════╣\n");
+            printf("║      Total Runtime      ║     %10ld seconds       ║\n", endTime - startTime);
+            printf("╠═════════════════════════╬══════════════════════════════╣\n");
+            printf("║       Frames Sent       ║     %10d               ║\n", framesSent);
+            printf("╠═════════════════════════╬══════════════════════════════╣\n");
+            printf("║     Frames Received     ║     %10d               ║\n", framesReceived);
+            printf("╠═════════════════════════╬══════════════════════════════╣\n");
+            printf("║    Data Transfer Time   ║     %10ld seconds       ║\n", endTime - startTimeConnection);
+            printf("╚═════════════════════════╩══════════════════════════════╝\n\n");
+            break;
+
+        default:
+            break;
+    }
 }
 
 ////////////////////////////////////////////////
 // LLCLOSE
 ////////////////////////////////////////////////
-int llclose(int showStatistics) {
-    unsigned char byte;
+int llclose(int showStatistics){
     LinkLayerState state = START;
-    int currentTransmition = retransmissions;
+    unsigned char byte;
+    alarmTriggered = FALSE;
+    int currentTransmission = retransmissions;
+
     switch (role) {
-        case LlTx: { // Transmitter     
-            // Install alarm handler
+        case (LlTx): {
+            // Set alarm handler
             (void) signal(SIGALRM, alarmHandler);
-            while (currentTransmition && state != STOP_RCV) {
-                //printf("Trying to establish connection...\n");
-                // Send DISC
-                if (writeTX(DISC) < 0) {
-                    printf("ERROR: Failed to send DISC\n");
-                    return -1;
+            alarmTriggered = FALSE;
+
+            // Send DISC frame
+            unsigned char frame_disc[5] = {FLAG, A_TX, C_DISC, A_TX ^ C_DISC, FLAG};
+            while (currentTransmission && state != STOP) {
+                if (writeBytesSerialPort(frame_disc, 5) < 0) {
+                    perror("ERROR: Error on writing to serial port. (6)\n");
                 }
-                // Set alarm 
-                //printf("Alarm #%d\n", alarmCount);
-                alarm(timeout);
+                framesSent++;
                 alarmTriggered = FALSE;
-                //printf("DISC sent: %x\n", DISC);
-                // Wait for DISC
-                while (state != STOP_RCV && alarmTriggered == FALSE) {
-                    //printf("Waiting for byte...\n");
-                    if (readByteSerialPort(&byte) > 0) { 
-                        //printf("Received byte: %x\n", byte);
+                alarm(timeout);
+
+                // Read DISC frame
+                while (!alarmTriggered && state != STOP) {
+                    unsigned char byte;
+                    int result;
+                    result = readByteSerialPort(&byte, 1);
+                    if (result > 0) {
                         switch (state) {
-                            case START:
+                            case START: {
                                 if (byte == FLAG) {
                                     state = FLAG_RCV;
-                                    //printf("FLAG OK!\n");
                                 }
                                 break;
+                            }
 
-                            case FLAG_RCV:
+                            case FLAG_RCV: {
                                 if (byte == A_RX) {
                                     state = A_RCV;
-                                    //printf("A OK!\n");
                                 }
                                 else if (byte != FLAG) {
                                     state = START;
-                                    //printf("NOT SUPPOSED TO BE FLAG!\n");
                                 }
                                 break;
+                            }
 
-                            case A_RCV:
-                                if (byte == DISC) {
+                            case A_RCV: {
+                                if (byte == C_DISC) {
                                     state = C_RCV;
-                                    //printf("C OK!\n");
                                 }
                                 else if (byte == FLAG) {
                                     state = FLAG_RCV;
-                                    //printf("FLAG OK!\n");
                                 }
                                 else {
                                     state = START;
-                                    //printf("NOT SUPPOSED TO BE FLAG!\n");
                                 }
                                 break;
+                            }
 
-                            case C_RCV:
-                                if (byte == A_RX^DISC) {
+                            case C_RCV: {
+                                if (byte == (C_DISC ^ A_RX)) {
                                     state = BCC_OK;
-                                    //printf("BCC OK!\n");
                                 }
                                 else if (byte == FLAG) {
                                     state = FLAG_RCV;
-                                    //printf("FLAG OK!\n");
                                 }
                                 else {
                                     state = START;
-                                    //printf("NOT SUPPOSED TO BE FLAG!\n");
                                 }
                                 break;
+                            }
 
-                            case BCC_OK:
+                            case BCC_OK: {
                                 if (byte == FLAG) {
-                                    state = STOP_RCV;
-                                    //printf("STOP OK!\n");
+                                    framesReceived++;
+                                    state = STOP;
                                 }
                                 else {
                                     state = START;
-                                    //printf("NOT SUPPOSED TO BE FLAG!\n");
                                 }
                                 break;
-                            
-                            default:
-                                break;
+                            }
                         }
                     }
                 }
-                currentTransmition--;
+                currentTransmission--;
             }
-            // If we didn't reached the STOP state (didn't received UA), we failed to establish connection
-            if (state != STOP_RCV) {
-                printf("ERROR: Failed to establish connection\n");
-                return -1;
-            }
-            alarm(0);
             break;
         }
 
-        case LlRx: { // Receiver
-            // Wait for DISC
-            while (state != STOP_RCV) {
-                //printf("Waiting for byte...\n");
-                if (readByteSerialPort(&byte) > 0) {
-                    //printf("Received byte: %x\n", byte);
+        case (LlRx): {
+            // Read DISC frame
+            while (state != STOP) {
+                int result = readByteSerialPort(&byte, 1);
+                if (result > 0) {
                     switch (state) {
                         case START:
                             if (byte == FLAG) {
                                 state = FLAG_RCV;
-                                //printf("FLAG OK!\n");
                             }
                             break;
 
                         case FLAG_RCV:
                             if (byte == A_TX) {
                                 state = A_RCV;
-                                //printf("A OK!\n");
                             }
                             else if (byte != FLAG) {
                                 state = START;
-                                //printf("NOT SUPPOSED TO BE FLAG!\n");
                             }
                             break;
 
                         case A_RCV:
-                            if (byte == DISC) {
+                            if (byte == C_DISC) {
                                 state = C_RCV;
-                                //printf("C OK!\n");
                             }
                             else if (byte == FLAG) {
                                 state = FLAG_RCV;
-                                //printf("FLAG OK!\n");
                             }
                             else {
                                 state = START;
-                                //printf("NOT SUPPOSED TO BE FLAG!\n");
                             }
                             break;
 
                         case C_RCV:
-                            if (byte == A_TX^DISC) {
+                            if (byte == (C_DISC ^ A_TX)) {
                                 state = BCC_OK;
-                                //printf("BCC OK!\n");
                             }
                             else if (byte == FLAG) {
                                 state = FLAG_RCV;
-                                //printf("FLAG OK!\n");
                             }
                             else {
                                 state = START;
-                                //printf("NOT SUPPOSED TO BE FLAG!\n");
                             }
                             break;
 
                         case BCC_OK:
                             if (byte == FLAG) {
-                                state = STOP_RCV;
-                                //printf("STOP OK!\n");
+                                framesReceived++;
+                                state = STOP;
                             }
                             else {
                                 state = START;
-                                //printf("NOT SUPPOSED TO BE FLAG!\n");
                             }
-                            break;
-                        
-                        default:
                             break;
                     }
                 }
             }
-            // If everything went well, send DISC
-            if (writeRX(DISC) < 0) {
-                printf("ERROR: Failed to send DISC\n");
-                return -1;
-            }
 
-            break;
+            // Send DISC frame
+            unsigned char frame_disc[5] = {FLAG, A_RX, C_DISC, A_RX ^ C_DISC, FLAG};
+            if (writeBytesSerialPort(frame_disc, 5) < 0) {
+                perror("ERROR: Error on writing to serial port. (7)\n");
+            }
+            framesSent++;
         }
 
         default:
-            return -1;
+            break;
     }
-    int clstat = closeSerialPort();
-    if (clstat < 0) {
-        printf("ERROR: Failed to close serial port\n");
+
+    time(&endTime);
+
+    if (state != STOP) {
         return -1;
     }
+
+    alarm(0);
+
+    printStats(role);
+
+    int clstat = closeSerialPort();
     return clstat;
 }
