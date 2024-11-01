@@ -394,7 +394,7 @@ int llwrite(const unsigned char *buf, int bufSize) {
     alarmCount = 0;
     (void) signal(SIGALRM, alarmHandler);
 
-    while (currentTransmission && !accepted && !rejected) {
+    while (currentTransmission > 0 && !accepted && !rejected) {
         if (writeBytesSerialPort(frame, frameSize) < 0) {
             perror("ERROR: Error on writing to serial port. (3)\n");
         }
@@ -404,7 +404,81 @@ int llwrite(const unsigned char *buf, int bufSize) {
         alarm(timeout);
 
         while (!alarmTriggered && !accepted && !rejected) {
-            unsigned char response = readControlFrame();
+            unsigned char response;
+            unsigned char byte;
+            LinkLayerState state = START;
+            int result;
+            while (state != STOP && !alarmTriggered) {
+                result = readByteSerialPort(&byte, 1);
+                if (result > 0) {
+                    switch (state){
+                        case START: {
+                            if (byte == FLAG) {
+                                state = FLAG_RCV;
+                            }
+                            break;
+                        }
+
+                        case FLAG_RCV: {
+                            if (byte == A_RX) {
+                                state = A_RCV;
+                            }
+                            else if (byte != FLAG) {
+                                state = START;
+                            }
+                            break;
+                        }
+
+                        case A_RCV: {
+                            if (byte == C_RR0 || byte == C_RR1 || byte == C_REJ0 || byte == C_REJ1 || byte == C_DISC) {
+                                state = C_RCV;
+                                response = byte;
+                            }
+                            else if (byte == FLAG) {
+                                state = FLAG_RCV;
+                            }
+                            else {
+                                state = START;
+                            }
+                            break;
+                        }
+
+                        case C_RCV: {
+                            if (byte == (A_RX ^ response)) {
+                                state = BCC_OK;
+                            }
+                            else if (byte == FLAG) {
+                                state = FLAG_RCV;
+                            }
+                            else {
+                                state = START;
+                            }
+                            break;
+                        }
+
+                        case BCC_OK: {
+                            if (byte == FLAG) {
+                                framesReceived++;
+                                state = STOP;
+                            }
+                            else {
+                                state = START;
+                            }
+                            break;
+                        }
+
+                        case STOP: {
+                            break;
+                        }
+
+                        default:
+                            return -1;
+                    }
+                }
+            }
+            if (state != STOP) {
+                continue;
+            }
 
             if (response == C_RR0 || response == C_RR1) {
                 accepted = TRUE;
@@ -450,7 +524,6 @@ int llread(unsigned char *packet){
         if (result > 0) {
             switch (state){
                 case START: {
-                    framesReceived++;
                     if (byte == FLAG) {
                         state = FLAG_RCV;
                     }
@@ -499,6 +572,7 @@ int llread(unsigned char *packet){
                         state = FOUND_DATA;
                     }
                     else if (byte == FLAG) {
+                        framesReceived++;
                         // Check BCC2
                         unsigned char BCC2 = packet[i - 1];
                         i--;
