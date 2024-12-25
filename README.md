@@ -1,6 +1,6 @@
 # Data Link Protocol over RS-232
 
-A project for the **Redes de Computadores** (Computer Networks) 2024-2025 course at **FEUP**, implementing a data link protocol for file transfer over RS-232 using the Stop-and-Wait protocol.
+A project for the **Redes de Computadores** (Computer Networks) 2024-2025 course at **FEUP**, implementing a data link protocol for file transfer over RS-232 using the Stop-and-Wait protocol. This README is the summary of the whole project, for a complete report about this work please check the [official report](https://github.com/GuilhermeRego/RCOM-Lab1/blob/main/RCOM_REPORT_LAB1_T9_up202207041_up202207784.pdf).
 
 ## Overview
 ### Features
@@ -14,12 +14,16 @@ A project for the **Redes de Computadores** (Computer Networks) 2024-2025 course
 
 ### Usage
 Run on two terminals for transmitter and receiver roles:
-```bash
-# Transmitter
-<PROGRAM> <SERIAL PORT> <BAUDRATE> tx <FILENAME>
 
-# Receiver
-<PROGRAM> <SERIAL PORT> <BAUDRATE> rx <OUTPUT_FILENAME>
+#### Transmitter
+```bash
+make run_tx
+```
+
+#### Receiver
+```bash
+make run_rx
+```
 
 ### Results
 - Efficient transfer with high reliability.
@@ -41,7 +45,7 @@ Connection: Established with SET and UA supervision frames.
 
 #### Error Handling: REJ and retransmissions for corrupted frames.
 
-####Validation
+#### Validation
 Tested with:
 
 - Variable file sizes and baud rates.
