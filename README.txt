@@ -1,42 +1,58 @@
-INSTRUCTIONS FOR SERIAL PORT PROTOCOL
-=====================================
+# Data Link Protocol over RS-232
 
-This folder contains the base code of the serial port protocol.
+A project for the **Redes de Computadores** (Computer Networks) 2024-2025 course at **FEUP**, implementing a data link protocol for file transfer over RS-232 using the Stop-and-Wait protocol.
 
-Project Structure
------------------
+## Overview
+### Features
+- Reliable file transfer using **Stop-and-Wait error control**.
+- RS-232 communication with framing, byte stuffing, and flow control.
+- Handles variable file sizes, noise levels, and baud rates.
 
-- bin/: Compiled binaries.
-- src/: Source code for the implementation of the link-layer and application layer protocols. Students should edit these files to implement the project.
-- include/: Header files of the link-layer and application layer protocols. These files must not be changed.
-- cable/: Virtual cable program to help test the serial port. This file must not be changed.
-- main.c: Main file. This file must not be changed.
-- Makefile: Makefile to build the project and run the application.
-- penguin.gif: Example file to be sent through the serial port.
+### Architecture
+- **Application Layer**: Handles user input, file management, and progress updates.
+- **Link Layer**: Manages connection setup, data transmission, and error handling.
 
-Instructions to Run the Project
--------------------------------
+### Usage
+Run on two terminals for transmitter and receiver roles:
+```bash
+# Transmitter
+<PROGRAM> <SERIAL PORT> <BAUDRATE> tx <FILENAME>
 
-1. Edit the source code in the src/ directory.
-2. Compile the application and the virtual cable program using the provided Makefile.
-3. Run the virtual cable program (either by running the executable manually or using the Makefile target):
-	$ sudo ./bin/cable_app
-	$ sudo make run_cable
+# Receiver
+<PROGRAM> <SERIAL PORT> <BAUDRATE> rx <OUTPUT_FILENAME>
 
-4. Test the protocol without cable disconnections and noise
-	4.1 Run the receiver (either by running the executable manually or using the Makefile target):
-		$ ./bin/main /dev/ttyS11 9600 rx penguin-received.gif
-		$ make run_rx
+### Results
+- Efficient transfer with high reliability.
+- Transfer time inversely proportional to baud rate.
+- Increased noise leads to longer transmission due to retransmissions.
 
-	4.2 Run the transmitter (either by running the executable manually or using the Makefile target):
-		$ ./bin/main /dev/ttyS10 9600 tx penguin.gif
-		$ make run_tx
+### Key Components
+#### Functions
+- Application Layer:
+sendControlPacket(), readControlPacket(), sendDataPacket(), updateProgressBar().
 
-	4.3 Check if the file received matches the file sent, using the diff Linux command or using the Makefile target:
-		$ diff -s penguin.gif penguin-received.gif
-		$ make check_files
+- Link Layer:
+llopen(), llwrite(), llread(), llclose().
 
-5. Test the protocol with cable disconnections and noise
-	5.1. Run receiver and transmitter again
-	5.2. Quickly move to the cable program console and press 0 for unplugging the cable, 2 to add noise, and 1 to normal
-	5.3. Check if the file received matches the file sent, even with cable disconnections or with noise
+#### Protocol
+Connection: Established with SET and UA supervision frames.
+
+#### Data Transmission: Packets sent with Stop-and-Wait protocol and byte stuffing.
+
+#### Error Handling: REJ and retransmissions for corrupted frames.
+
+####Validation
+Tested with:
+
+- Variable file sizes and baud rates.
+- Simulated noise and interruptions.
+
+### Conclusions
+This project demonstrated:
+
+- The impact of baud rate and noise on transfer efficiency.
+- Robust file transfer under adverse conditions using Stop-and-Wait.
+
+### Authors
+Gabriel da Quinta Braga (up202207784)
+Guilherme Silveira Rego (up202207041)
