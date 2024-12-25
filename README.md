@@ -53,6 +53,22 @@ Tested with:
 - Variable file sizes and baud rates.
 - Simulated noise and interruptions.
 
+Example of the program's execution:
+- Transmitter:
+
+![image](https://github.com/user-attachments/assets/a90bd864-6a9b-4535-85e6-931e78672cce)
+
+- Receiver:
+
+![image](https://github.com/user-attachments/assets/1593929d-372b-4a4f-a7dc-7dd9070ea659)
+
+Checking differences between the original file and the result:
+
+![image](https://github.com/user-attachments/assets/7faa9525-65fb-4d3f-a7d4-1733c6eb6f24)
+
+![image](https://github.com/user-attachments/assets/02ed0211-784e-4bea-bc42-bdd32a7a6131)
+
+
 ### Conclusions
 This project demonstrated:
 
